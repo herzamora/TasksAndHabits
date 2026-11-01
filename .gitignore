@@ -13,3 +13,14 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Kotlin compiler session/error files
+.kotlin/
+
+# Per-machine IDE state (includes the connected device's identifier)
+/.idea/deploymentTargetSelector.xml
+
+# Signing keys and secrets: never commit
+*.jks
+*.keystore
+keystore.properties
