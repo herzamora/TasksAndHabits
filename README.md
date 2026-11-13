@@ -2,7 +2,7 @@
 
 A native Android app for personal daily productivity: simple, date-bound **tasks** and recurring **daily habits** in one lightweight, offline-first experience.
 
-> **Status:** work in progress. Phase 0 (setup) is done and Phase 1 (data layer) is next. There is no usable app yet.
+> **Status:** work in progress. Phase 0 (setup) and Phase 1 (data layer) are done; Phase 2 (domain & ViewModels) is next. The database layer is implemented and tested, but there is no usable UI yet.
 
 This is my **first Android project**. The goal is to learn modern Android development and to document the process in the open: the decisions, the trade-offs, and what I learn along the way.
 
@@ -22,14 +22,15 @@ This is my **first Android project**. The goal is to learn modern Android develo
 | Language | Kotlin 2.x |
 | UI | Jetpack Compose + Material Design 3 |
 | Architecture | MVVM with unidirectional data flow |
-| Local database | Room 3 (`androidx.room3`) with KSP |
+| Local database | Room 3 (`androidx.room3`) with KSP and the Room Gradle plugin (schema export) |
+| SQLite driver | `AndroidSQLiteDriver` (the SQLite that ships with Android) |
 | Async & state | Coroutines, Kotlin Flow, ViewModel (`StateFlow`) |
 | Navigation | Navigation Compose |
 | Reminders | `AlarmManager` (exact alarms) + `BroadcastReceiver`s + notifications |
 | Dependency injection | Manual (a simple container), no framework yet |
 | Min SDK | 26 (Android 8.0) |
 | Build | Gradle with Kotlin DSL, version catalog |
-| Tests | JUnit for logic, instrumented tests for the database |
+| Tests | JUnit for logic, instrumented tests (in-memory Room database) for the data layer |
 
 ## Architecture
 
@@ -45,10 +46,28 @@ This is my **first Android project**. The goal is to learn modern Android develo
 
 Pure logic (habit status, streaks) lives in plain Kotlin, separate from Android classes, so it can be unit-tested.
 
+The data layer (entities, DAOs, database) is implemented and tested. The layers above it are next.
+
+## Project structure
+
+```
+app/src/main/java/com/herzamora/tasksandhabits/
+└── data/
+    ├── AppDatabase.kt        database class + builder (driver configuration)
+    ├── dao/                  TaskDao, HabitDao, HabitLogDao
+    └── entity/               TaskEntity, HabitEntity, HabitLogEntity
+
+app/src/androidTest/java/com/herzamora/tasksandhabits/
+└── data/
+    └── DaoTest.kt            instrumented tests on an in-memory database
+
+app/schemas/                  exported Room schema (version-controlled)
+```
+
 ## Roadmap
 
 - [x] **Phase 0: Setup.** Project from the template, running on a physical device, repository and README on GitHub.
-- [ ] **Phase 1: Data layer.** Room 3 + KSP, entities, DAOs, in-memory database tests.
+- [x] **Phase 1: Data layer.** Room 3 + KSP, entities, DAOs, database class, in-memory database tests.
 - [ ] **Phase 2: Domain & ViewModels.** Repositories, streak and status logic (unit-tested), UI state.
 - [ ] **Phase 3: User interface.** Compose screens, navigation, date and time pickers.
 - [ ] **Phase 4: Reminders.** Notification channel, permission flows, exact alarms with fallback, re-scheduling after reboot.
@@ -68,10 +87,15 @@ Phases are an order of work, not a schedule.
 | **`SCHEDULE_EXACT_ALARM` with a fallback to inexact alarms.** | Reminders are user-set and time-sensitive. From Android 14 the permission is not granted by default, so the app checks it, sends the user to settings, and degrades gracefully if it is denied. `USE_EXACT_ALARM` is meant for calendar and alarm-clock apps. |
 | **Manual dependency injection.** | Keeps the wiring visible while learning. Hilt or Koin may come after the MVP as a deliberate exercise. |
 | **Min SDK 26.** | `java.time` and notification channels work without compatibility layers. |
+| **`AndroidSQLiteDriver` instead of `BundledSQLiteDriver`.** | It is what the official Android-only Room guide uses, and it adds no dependency or APK weight. The queries need no newer SQLite features, Android Studio's Database Inspector is built for the system SQLite, and the tests use the same driver as the app. Switching later is a one-line change. |
+| **`AUTOINCREMENT` ids (Room's default).** | Ids are never reused, so an alarm tied to a deleted task's id can never fire for a different task. The Room docs advise avoiding it unless needed; at this scale the performance cost is irrelevant, so it is cheap insurance. |
+| **"Today" is passed to queries as a parameter, not computed with `date('now')` in SQL.** | SQLite's `date('now')` is UTC, which can differ from the local date near midnight. Passing it in keeps the clock under the app's control and makes tests deterministic. |
+| **Marking a habit is idempotent.** | Inserting a log ignores duplicates and un-marking is a plain delete, so repeating either is safe and no "does it exist?" check is needed. A log for a habit that does not exist is still rejected by the foreign key. |
+| **The Habits screen observes all logs in a single `Flow` and groups them in Kotlin.** | It avoids one stream per habit. At roughly 10 habits x 365 days a year the table stays tiny. If it ever grows, windowed queries are the next step. |
 
 ### Still open
 
-Proposed defaults are used until decided.
+Proposed defaults are used until decided. The data layer already supports the defaults for the last three questions; the first one is a validation rule for the UI and reminder phases.
 
 | Question | Proposed default |
 | :--- | :--- |
@@ -80,13 +104,62 @@ Proposed defaults are used until decided.
 | Where do overdue pending tasks appear? | At the top of "Today", visually marked. |
 | Does the MVP offer both archive and delete for habits? | Both: archive hides a habit but keeps its history; delete removes it with its logs. |
 
-## Data model (planned)
+## Data model
 
-* **Task:** title, optional description, completed flag, optional due date (date only), optional reminder (exact instant).
-* **Habit:** title, archived flag, creation time.
-* **HabitLog:** one row per habit per day, with a composite key `(habitId, date)`. A row means the habit was done that day.
+Room schema, **version 1** (exported to `app/schemas/`).
 
-The full schema will be documented here once it is implemented in Phase 1.
+```
++----------------------------------------------+
+|                    tasks                     |
++----------------------------------------------+
+| id           Long     PK, autoincrement      |
+| title        String                          |
+| description  String?                         |
+| isCompleted  Boolean                         |
+| dueDate      String?  "YYYY-MM-DD", date only|
+| reminderAt   Long?    epoch millis (UTC)     |
+| createdAt    Long     epoch millis (UTC)     |
++----------------------------------------------+
+
++----------------------------------------------+
+|                   habits                     |
++----------------------------------------------+
+| id           Long     PK, autoincrement      |
+| title        String                          |
+| isArchived   Boolean                         |
+| createdAt    Long     epoch millis (UTC)     |
++----------------------------------------------+
+                      │ 1
+                      │
+                      │ *
++----------------------------------------------+
+|                 habit_logs                   |
++----------------------------------------------+
+| habitId      Long     FK -> habits.id        |
+|                       ON DELETE CASCADE      |
+| date         String   "YYYY-MM-DD", local    |
+| PK: composite (habitId, date)                |
++----------------------------------------------+
+  A row exists  = the habit was done that day.
+  No row        = not done.
+```
+
+* `dueDate` is a calendar date; `reminderAt` is an exact instant. They are independent.
+* Deleting a habit deletes its logs. Archiving a habit (`isArchived`) hides it but keeps its history.
+* There is no separate index on `habit_logs.habitId`: it is the first column of the composite primary key.
+
+### Data access (DAOs)
+
+| DAO | Writes (`suspend`) | Reads |
+| :--- | :--- | :--- |
+| `TaskDao` | `insert`, `update`, `setCompleted`, `deleteById` | `getById`; `Flow`: `observeDueFrom(today)`, `observeOverdue(today)`, `observeUndated()` |
+| `HabitDao` | `insert`, `update`, `setArchived`, `deleteById` | `getById`; `Flow`: `observeActive()`, `observeArchived()` |
+| `HabitLogDao` | `insert` (ignores duplicates), `delete(habitId, date)` | `Flow`: `observeAll()`, `observeBetween(habitId, startDate, endDate)` |
+
+### Derived state (implemented in Phase 2)
+
+* **Habit status for a date:** done if a log exists; missed if the date is before today, not before the habit was created, and has no log; otherwise pending (today) or not applicable.
+* **Current streak:** count consecutive logged days going back from today. If today is not logged yet, start from yesterday, so the streak is not lost just because the day is not over.
 
 ## Getting started
 
@@ -102,6 +175,14 @@ Open the folder in Android Studio, wait for the Gradle sync, and run the `app` c
 ./gradlew installDebug
 ```
 
+To run the instrumented database tests (a connected device or running emulator is required):
+
+```bash
+./gradlew connectedDebugAndroidTest
+```
+
+You can also run them from Android Studio with the green arrow next to `DaoTest`.
+
 ## Learning log
 
 ### Phase 0: Setup
@@ -110,3 +191,13 @@ Open the folder in Android Studio, wait for the Gradle sync, and run the `app` c
 * Project created from the **Empty Activity** (Compose) template: package `com.herzamora.tasksandhabits`, min SDK 26, Gradle Kotlin DSL.
 * Enabled USB debugging, connected the phone through ADB, and deployed the template ("Hello Android!") to a physical device.
 * Initialized the repository with a first commit from the untouched template and pushed `main` to GitHub.
+
+### Phase 1: Data layer
+
+* Added Room 3 and KSP through the version catalog, plus the Room Gradle plugin so the schema is exported to `app/schemas/` and version-controlled, ready for future migrations. Used the latest stable Room release (3.0.x) rather than the alpha line.
+* Wrote the three entities: a composite primary key `(habitId, date)` and an explicit foreign key with `ON DELETE CASCADE` on the log table, and calendar dates stored as ISO text.
+* Wrote the DAOs with `suspend` functions for writes and `Flow` for reads. In Room 3, `Flow` functions are not `suspend`.
+* Defined `AppDatabase` and configured `AndroidSQLiteDriver`: Room 3 requires choosing a SQLite driver explicitly.
+* Wrote 10 instrumented tests against an in-memory database and ran them on a physical phone: entity mapping, cascade delete, idempotent log insert, rejection of logs for unknown habits, the date-range query, and the three task-group queries.
+* Checked that the tests can fail: removed `ON DELETE CASCADE` from the log entity, watched the cascade test fail, then restored it. The passing run also showed that SQLite foreign keys are enforced in this setup.
+* Differences from most online tutorials (written for Room 2.x): the `androidx.room3` package, the mandatory SQLite driver, and `Flow` queries that are not `suspend`.
